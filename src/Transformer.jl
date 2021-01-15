@@ -5,8 +5,12 @@ module Transformer
 
 using Random
 
+using NNlib
+
 using Flux
-using Flux: softmax, glorot_uniform, Dense, gelu, LayerNorm, trainable, Dropout
+using Flux: softmax, glorot_uniform, Dense, gelu, relu, LayerNorm, trainable, Dropout
+
+using TensorOperations
 
 using Plots
 
@@ -49,13 +53,13 @@ end
 struct FeedForward
 	d_model
 	d_proj
-	dense_α
-	dense_β
+	dense_α::Dense
+	dense_β::Dense
 end
 
 FeedForward(d_model, d_proj) = FeedForward(d_model,
 											d_proj,
-											Dense(d_model, d_proj, gelu),
+											Dense(d_model, d_proj, relu),
 											Dense(d_proj, d_model))
 
 
@@ -68,7 +72,7 @@ struct PositionalEncoding
 end
 
 function compute_positional_encoding(d_model, max_len)
-	pe = zeros(d_model, max_len)
+	pe = zeros(Float32, d_model, max_len)
 	positions = 0.:max_len-1
 	div_term = exp.((0.:2:d_model-1) .* (-log(10_000) / d_model))
 
@@ -154,20 +158,43 @@ Flux.trainable(m::TransformerModel) = (m.encoder, m.embeddings)
 # Implementations of layers
 (m::Attention)(x) = m(x, x, x)
 
-(m::Attention)(q, k, v) = softmax((m.W_q * q * (m.W_k * k)') ./ sqrt(m.d_proj)) * (m.W_v * v)
+function (m::Attention)(q::Array{F, 3}, k::Array{F, 3}, v::Array{F, 3}) where {F <: AbstractFloat}
+	Wq, Wk, Wv = m.W_q, m.W_k, m.W_v 
+	@tensor left[s,p,b] := Wq[p,m1] * q[m1,s,b]
+	@tensor right[p,t,b] := Wk[p,m2] * k[m2,t,b]
+	soft = softmax(Flux.batched_mul(left, right) ./ sqrt(m.d_proj))
+	proj = Flux.batched_mul(v, soft)
+	@tensor res[p,s,b] := Wv[p,m3] * proj[m3,s,b]
+end
 
-(m::MultiheadAttention)(x) = vcat([attn(x) for attn in m.attn_heads]...)
 
-(m::FeedForward)(x) = x |> m.dense_α |> m.dense_β
+(m::Attention)(q::Array{F, 2}, k::Array{F, 2}, v::Array{F, 2}) where {F <: AbstractFloat} = (m.W_v * v) * softmax(((m.W_q * q)' * m.W_k * k) ./ sqrt(m.d_proj)) 
 
-(m::PositionalEncoding)(x) = x + m.pe[:, 1:size(x, 2)] |> m.dropout
+(m::MultiheadAttention)(x) = reduce(vcat, [attn(x) for attn in m.attn_heads])
 
-(m::Embedding)(x) = m.w * x
+function (m::FeedForward)(x::Array{F, 3}) where {F <: AbstractFloat}
+	error("unimplemented")
+	W1, b1, σ1 = m.dense_α.W, m.dense_α.b, m.dense_α.σ
+	W2, b2, σ2 = m.dense_β.W, m.dense_β.b, m.dense_β.σ
+
+	proj = (W1 ⊠ x) + b1 |> σ1
+	res = (W2 ⊠ proj) + b2 |> σ2
+	res
+end
+
+(m::FeedForward)(x::Array{F, 2}) where {F <: AbstractFloat} = x |> m.dense_α |> m.dense_β
+
+(m::PositionalEncoding)(x) = x .+ m.pe[:, 1:size(x, 2)] |> m.dropout
+
+(m::Embedding)(x) = m.w[:, x]
 
 function (m::TransformerEncoderLayer)(x)
-	y = (x |> m.multihead_attn) + x |> m.norm_attn
-	z = (y |> m.feed_forward) + y |> m.norm_ffwd
-	z
+	# y = m.norm_attn((x |> m.multihead_attn) + x)
+	y = x
+	# z = m.norm_ffwd((y |> m.feed_forward) + y)
+	z = y |> m.feed_forward
+	println(z .|> [abs] |> sum)
+	z + x
 end
 
 function (m::TransformerEncoder)(x)
@@ -179,7 +206,7 @@ end
 
 function (m::TransformerModel)(x)
 	y = x |> m.embeddings |> m.pos_encoding
-	z = inverse_embedding(m.embeddings, y |> m.encoder) |> softmax
+	z = inverse_embedding(m.embeddings, y |> m.encoder)
 	z
 end
 
@@ -192,7 +219,7 @@ heatmap(PositionalEncoding(512).pe')
 transformer = TransformerEncoder(10, 3, 2, 15)
 
 
-x = rand(10, 20)
+x = rand(Float32, 10, 20)
 x |> transformer
 
 end  # end module Transformer
